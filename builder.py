@@ -612,6 +612,15 @@ def update_readme(stats):
 # ===================== 主函数 =====================
 
 def main():
+    # ===================== 自动创建缺失文件和目录（避免git-add报错） =====================
+    # 确保 known_sources.txt 和 community_sources.txt 存在（如果不存在则创建空文件）
+    Path("known_sources.txt").touch()
+    Path("community_sources.txt").touch()
+    # 确保 jars、lines、archives 目录存在
+    Path("jars").mkdir(exist_ok=True)
+    Path("lines").mkdir(exist_ok=True)
+    Path("archives").mkdir(exist_ok=True)
+
     # 读取环境变量
     gh_token = os.environ.get('GH_TOKEN', '')
     validity_days = int(os.environ.get('VALIDITY_DAYS', 3))
