@@ -5,6 +5,7 @@
 影视仓自动化多仓更新脚本
 功能：每日采集、验证、打包多仓线路，支持jar备份与替换、源质量淘汰、告警等
 内部请求使用原始 raw 地址，对外输出使用 jsdelivr CDN 地址
+最终输出标准多线路格式：{"urls": [{"name":"...", "url":"..."}]}
 """
 
 import os
@@ -427,10 +428,12 @@ def verify_functional(url, state, max_size):
         data = json.loads(content.decode('utf-8'))
         if not isinstance(data, dict):
             return False, None, None
+        # 严格检查：必须包含 sites 字段且为非空数组
         if 'sites' not in data or not isinstance(data['sites'], list) or len(data['sites']) == 0:
             return False, None, None
         first_site = data['sites'][0]
-        if not isinstance(first_site, dict) or 'key' not in first_site:
+        # 检查第一个站点是否有 key 和 name（基本要求）
+        if not isinstance(first_site, dict) or 'key' not in first_site or 'name' not in first_site:
             return False, None, None
         jar_url = data.get('spider')
         content_hash = hashlib.sha256(content).hexdigest()
@@ -612,11 +615,9 @@ def update_readme(stats):
 # ===================== 主函数 =====================
 
 def main():
-    # ===================== 自动创建缺失文件和目录（避免git-add报错） =====================
-    # 确保 known_sources.txt 和 community_sources.txt 存在（如果不存在则创建空文件）
+    # 自动创建缺失文件和目录
     Path("known_sources.txt").touch()
     Path("community_sources.txt").touch()
-    # 确保 jars、lines、archives 目录存在，并创建 .gitkeep 文件以便 git 跟踪空目录
     for d in ["jars", "lines", "archives"]:
         path = Path(d)
         path.mkdir(exist_ok=True)
@@ -658,7 +659,7 @@ def main():
             "source_last_parse": {}
         }
 
-    # 步骤2：加载已知多仓源（原始地址，不做CDN转换）
+    # 步骤2：加载已知多仓源
     known_sources = load_known_sources()
     known_sources = [normalize_for_request(src) for src in known_sources]
 
@@ -687,7 +688,7 @@ def main():
     # 步骤5：源质量淘汰（每月1日）
     known_sources = evict_low_quality_sources(state, known_sources, max_sources)
 
-    # 步骤5b：源轮询限流（选择最久未解析的源）
+    # 源轮询限流
     now_ts = time.time()
     source_last_parse = state.get("source_last_parse", {})
     sources_with_priority = [(source_last_parse.get(src, 0), src) for src in known_sources]
@@ -695,7 +696,7 @@ def main():
     selected_sources = [src for _, src in sources_with_priority[:max_sources_per_day]]
     log(f"今日选择解析 {len(selected_sources)} 个源（共 {len(known_sources)} 个）")
 
-    # 步骤6：解析选中的源，提取单线路URL
+    # 步骤6：解析提取单线路
     all_line_urls = set()
     for src in selected_sources:
         log(f"解析源: {src}")
@@ -826,14 +827,14 @@ def main():
             if state["cache_headers"][key].get("last_accessed", 0) < cutoff:
                 del state["cache_headers"][key]
 
-    # 步骤14：输出限流与排序（最终输出时转换为CDN地址）
+    # ========== 最终输出：标准多线路格式 ==========
     line_scores = []
     for url, info in state["valid_lines"].items():
         score = info.get("last_func", 0) * (1 + 0.5 * (1 if info.get("jar_backup_hash") else 0))
         line_scores.append((score, url, info))
     line_scores.sort(key=lambda x: x[0], reverse=True)
     final_lines = line_scores[:max_output]
-    multibox = []
+    multibox = {"urls": []}   # 标准多线路格式
     base_cdn = get_local_base_url()
     for idx, (_, url, info) in enumerate(final_lines, 1):
         if "local_line_path" in info and base_cdn:
@@ -841,12 +842,12 @@ def main():
             final_url = f"{base_cdn}/lines/{line_hash}.json"
         else:
             final_url = to_jsdelivr_url(url)
-        multibox.append({"name": f"线路_{idx:04d}", "url": final_url})
+        multibox["urls"].append({"name": f"线路_{idx:04d}", "url": final_url})
     with open("multibox.json", "w", encoding='utf-8') as f:
         json.dump(multibox, f, indent=2, ensure_ascii=False)
-    log(f"生成 multibox.json，包含 {len(multibox)} 条有效单线路（已转换为CDN地址）")
+    log(f"生成 multibox.json，包含 {len(multibox['urls'])} 条有效单线路（标准多线路格式）")
 
-    # 步骤15：版本归档
+    # 版本归档
     archive_dir = Path("archives")
     archive_dir.mkdir(exist_ok=True)
     archive_file = archive_dir / f"multibox_{datetime.now().strftime('%Y-%m-%d')}.json"
@@ -860,12 +861,12 @@ def main():
         except:
             pass
 
-    # 步骤16：告警
+    # 告警
     total_verify = verified_success + verified_fail
     if total_verify > 50 and verified_fail / total_verify > alert_failure_ratio:
         send_alert(f"今日验证失败率过高: {verified_fail}/{total_verify} ({verified_fail/total_verify:.1%})", "warning")
 
-    # 步骤17：更新README
+    # 更新README
     stats = {
         "date": datetime.now().strftime("%Y-%m-%d"),
         "total_sources": len(known_sources),
@@ -873,7 +874,7 @@ def main():
         "verified_today": total_verify,
         "verified_success": verified_success,
         "verified_fail": verified_fail,
-        "final_lines": len(multibox),
+        "final_lines": len(multibox["urls"]),
         "jars_backup": jar_backup_count,
         "jars_replaced": replaced_count
     }
@@ -884,7 +885,7 @@ def main():
         json.dump(state, f, indent=2)
 
     log("全部步骤执行完毕")
-    send_alert(f"每日更新完成: 有效线路 {len(multibox)} 条", "info")
+    send_alert(f"每日更新完成: 有效线路 {len(multibox['urls'])} 条", "info")
 
 if __name__ == "__main__":
     main()
