@@ -1,1 +1,113 @@
-1
+# ============================================================
+# 工作流名称：每日自动更新影视仓多仓仓库
+# ============================================================
+name: 'Daily Update Multi-Box Repository'
+
+# ============================================================
+# 触发条件
+# ============================================================
+on:
+  # 定时触发：每天 UTC 20:20 运行（北京时间次日 04:20）
+  # 选择这个时间是为了避开网络高峰，保证用户起床前完成更新
+  schedule:
+    - cron: '20 20 * * *'
+  # 手动触发：允许在 GitHub Actions 页面点击按钮手动运行
+  workflow_dispatch:
+
+# ============================================================
+# 权限：需要写入仓库内容（提交文件）
+# ============================================================
+permissions:
+  contents: write
+
+jobs:
+  build-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      # 步骤1：检出仓库代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 步骤2：设置 Python 环境（版本 3.10）
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      # 步骤3：安装依赖（requests 用于网络请求，beautifulsoup4 用于解析 HTML 社区源）
+      - name: Install dependencies
+        run: |
+          pip install requests beautifulsoup4
+
+      # 步骤4：执行核心脚本
+      - name: Run builder script
+        env:
+          # ---------- 必填配置 ----------
+          # GitHub Personal Access Token（需在仓库 Secrets 中配置）
+          # 权限要求：repo、workflow
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          
+          # 告警 Webhook 地址（可选，支持 Telegram/钉钉/Server酱）
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+
+          # ---------- 验证有效期配置（单位：天） ----------
+          # 存活验证有效期：有效线路超过此天数未做存活检查，则重新验证
+          VALIDITY_DAYS: 3
+          # 功能验证有效期：有效线路超过此天数未做完整功能检查，则重新下载 JSON 并验证格式
+          FUNC_CHECK_DAYS: 7
+          # 失效线路冷却期：验证失败的线路在此天数内不再验证，避免频繁请求失效源
+          COOLING_DAYS: 7
+          # jar 存活检查周期：定期检查原始 jar 地址是否恢复可用，以便恢复原始引用
+          JAR_LIVE_CHECK_DAYS: 3
+
+          # ---------- 数量限制配置 ----------
+          # 最终输出的多仓文件最大线路数（影视仓加载太多线路会卡顿，建议 200 以内）
+          MAX_OUTPUT_LINES: 200
+          # 每日最多验证的线路数（避免脚本运行过久，超出 GitHub Actions 时间限制）
+          MAX_VERIFY_PER_DAY: 500
+          # 每日最多备份的 jar 文件数（防止仓库体积过快膨胀）
+          MAX_JAR_BACKUPS_PER_DAY: 50
+          # 已知多仓源最大保留数量（超出时按质量分淘汰低分源）
+          MAX_SOURCES: 200
+          # 每日最多解析的已知源数量（轮询解析，避免一天内处理所有源）
+          MAX_SOURCES_PER_DAY: 50
+
+          # ---------- 社区采集配置 ----------
+          # 从社区页面采集新源的间隔天数（例如每7天去抓取一次内置的聚合页面）
+          COMMUNITY_FETCH_INTERVAL_DAYS: 7
+          # 是否启用社区采集（true/false）
+          ENABLE_COMMUNITY_FETCH: true
+
+          # ---------- 存档与淘汰配置 ----------
+          # 保留归档文件的天数（archives/ 目录下的历史 multibox 文件）
+          ARCHIVE_DAYS: 30
+          # 触发告警的失败率阈值（存活验证失败数 / 总验证数 > 此值时发送告警）
+          ALERT_FAILURE_RATIO: 0.1
+          # 是否启用源质量自动淘汰（每月执行）
+          ENABLE_SOURCE_EVICTION: true
+
+          # ---------- 网络请求配置 ----------
+          # 请求超时时间（秒）
+          REQUEST_TIMEOUT: 15
+          # 功能验证时下载 JSON 的最大大小（字节，默认 10MB）
+          MAX_CONTENT_SIZE: 10485760
+          # jar 文件最大下载大小（字节，默认 10MB）
+          MAX_JAR_SIZE: 10485760
+          # 并发验证线程数（降低以避免目标服务器封 IP）
+          CONCURRENCY: 5
+          # 是否输出调试日志（true/false）
+          DEBUG: false
+
+        run: |
+          python builder.py
+
+      # 步骤5：提交并推送所有变更
+      # 包括：known_sources.txt, community_sources.txt, state.json, multibox.json,
+      #       jars/, lines/, archives/ 目录下的新增或修改文件
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'Daily automated update'
+          commit_user_name: 'github-actions[bot]'
+          commit_user_email: 'github-actions[bot]@users.noreply.github.com'
+          file_pattern: 'known_sources.txt community_sources.txt state.json multibox.json jars/* lines/* archives/* README.md'
