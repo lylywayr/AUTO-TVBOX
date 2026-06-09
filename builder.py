@@ -616,10 +616,13 @@ def main():
     # 确保 known_sources.txt 和 community_sources.txt 存在（如果不存在则创建空文件）
     Path("known_sources.txt").touch()
     Path("community_sources.txt").touch()
-    # 确保 jars、lines、archives 目录存在
-    Path("jars").mkdir(exist_ok=True)
-    Path("lines").mkdir(exist_ok=True)
-    Path("archives").mkdir(exist_ok=True)
+    # 确保 jars、lines、archives 目录存在，并创建 .gitkeep 文件以便 git 跟踪空目录
+    for d in ["jars", "lines", "archives"]:
+        path = Path(d)
+        path.mkdir(exist_ok=True)
+        keep_file = path / ".gitkeep"
+        if not keep_file.exists():
+            keep_file.touch()
 
     # 读取环境变量
     gh_token = os.environ.get('GH_TOKEN', '')
