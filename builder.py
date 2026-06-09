@@ -3,9 +3,8 @@
 
 """
 影视仓自动化多仓更新脚本
-功能：每日采集、验证、打包多仓线路，支持jar备份与替换、源质量淘汰、告警等
+功能：每日采集、验证、打包多仓线路，最终输出标准多线路格式：{"urls": [{"name":"...", "url":"..."}]}
 内部请求使用原始 raw 地址，对外输出使用 jsdelivr CDN 地址
-最终输出标准多线路格式：{"urls": [{"name":"...", "url":"..."}]}
 """
 
 import os
@@ -14,12 +13,10 @@ import json
 import re
 import time
 import hashlib
-import random
 import subprocess
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from requests.adapters import HTTPAdapter
@@ -28,7 +25,7 @@ from bs4 import BeautifulSoup
 
 # ===================== 配置区域 =====================
 
-# 内置知名多仓源（原始 raw 地址或可还原的代理地址） 共计 35+ 个
+# 内置知名多仓源（原始 raw 地址或可还原的代理地址）
 DEFAULT_SOURCES = [
     "https://raw.githubusercontent.com/liu673cn/box/main/m.json",
     "https://raw.githubusercontent.com/liu673cn/box/main/xiaobai.json",
@@ -70,7 +67,7 @@ DEFAULT_SOURCES = [
     "https://dxawi.github.io/0/0.json",
 ]
 
-# 内置社区源列表（用于发现新多仓）共计 50+ 个
+# 内置社区源列表（用于发现新多仓）
 DEFAULT_COMMUNITY_SOURCES = [
     "https://agit.ai/nbwzlyd/zyd/raw/branch/master/0.json",
     "https://agit.ai/nbwzlyd/zyd/raw/branch/master/1.json",
@@ -151,6 +148,7 @@ PROXY_PATTERNS = [
 
 _session = None
 def get_session():
+    """获取带重试机制的 requests 会话（单例）"""
     global _session
     if _session is None:
         _session = requests.Session()
@@ -160,6 +158,7 @@ def get_session():
     return _session
 
 def log(msg, level="info"):
+    """输出日志，调试模式下打印更多信息"""
     if os.environ.get("DEBUG", "false").lower() == "true" or level == "error":
         print(f"[{level.upper()}] {msg}")
 
@@ -167,6 +166,8 @@ def log(msg, level="info"):
 
 def restore_github_raw_url(url):
     """将各种代理地址还原为原始 raw.githubusercontent.com 地址（用于内部请求）"""
+    if not isinstance(url, str):
+        return url
     for pattern, repl_func in PROXY_PATTERNS:
         m = re.match(pattern, url, re.I)
         if m:
@@ -176,7 +177,9 @@ def restore_github_raw_url(url):
     return url
 
 def to_jsdelivr_url(raw_url):
-    """仅用于最终输出：将 raw 地址转换为 jsdelivr CDN 地址（非 GitHub 源则原样返回）"""
+    """仅用于最终输出：将 raw 地址转换为 jsdelivr CDN 地址（非 GitHub raw 地址则原样返回）"""
+    if not isinstance(raw_url, str):
+        return raw_url
     pattern = r'^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$'
     m = re.match(pattern, raw_url)
     if m:
@@ -185,12 +188,26 @@ def to_jsdelivr_url(raw_url):
     return raw_url
 
 def normalize_for_request(url):
-    """内部请求使用：只还原代理，不转CDN"""
+    """内部请求使用：只还原代理，不转 CDN"""
     return restore_github_raw_url(url)
+
+# ===================== 文件与目录初始化 =====================
+
+def ensure_required_files():
+    """确保运行必要的空文件和目录存在，避免 git 操作报错"""
+    Path("known_sources.txt").touch()
+    Path("community_sources.txt").touch()
+    for d in ["jars", "lines", "archives"]:
+        path = Path(d)
+        path.mkdir(exist_ok=True)
+        keep_file = path / ".gitkeep"
+        if not keep_file.exists():
+            keep_file.touch()
 
 # ===================== 文件加载 =====================
 
 def load_file_sources(filepath, description):
+    """从文本文件加载 URL 列表（每行一个，支持 # 注释）"""
     sources = []
     if filepath.exists():
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -204,6 +221,7 @@ def load_file_sources(filepath, description):
     return sources
 
 def load_known_sources():
+    """加载已知多仓源：内置 + 外部 known_sources.txt，合并去重"""
     sources = DEFAULT_SOURCES.copy()
     external = load_file_sources(Path("known_sources.txt"), "外部已知源")
     sources.extend(external)
@@ -217,6 +235,7 @@ def load_known_sources():
     return unique
 
 def load_community_sources():
+    """加载社区源列表：内置 + 外部 community_sources.txt，合并去重"""
     sources = DEFAULT_COMMUNITY_SOURCES.copy()
     external = load_file_sources(Path("community_sources.txt"), "外部社区源")
     sources.extend(external)
@@ -229,9 +248,13 @@ def load_community_sources():
     log(f"社区源总计: {len(unique)} 个 (内置 {len(DEFAULT_COMMUNITY_SOURCES)}, 外部 {len(external)})")
     return unique
 
-# ===================== 缓存请求 =====================
+# ===================== 带缓存的网络请求 =====================
 
 def fetch_json_with_cache(url, state, use_cache=True):
+    """
+    下载 JSON 并支持 HTTP 缓存（ETag/Last-Modified）
+    返回解析后的 JSON 对象，如果 304 未修改则返回 None
+    """
     cache_key = f"cache_{url}"
     headers = {}
     if use_cache and "cache_headers" in state and cache_key in state["cache_headers"]:
@@ -259,6 +282,7 @@ def fetch_json_with_cache(url, state, use_cache=True):
     return None
 
 def download_file(url, max_size, timeout=30):
+    """下载二进制文件，限制大小，返回内容或 None"""
     try:
         resp = get_session().get(url, timeout=timeout, stream=True)
         if resp.status_code == 200:
@@ -276,12 +300,14 @@ def download_file(url, max_size, timeout=30):
 # ===================== 社区源采集 =====================
 
 def extract_urls_from_html(html_content):
+    """从 HTML 页面中提取可能的多仓 URL（仅限代码托管平台）"""
     soup = BeautifulSoup(html_content, 'html.parser')
     urls = set()
     for a in soup.find_all('a', href=True):
         href = a['href']
         if href.startswith('http') and any(ext in href for ext in ['.json', '.txt', 'raw.githubusercontent', 'gitlab', 'agit', 'bitbucket']):
             urls.add(href)
+    # 正则从纯文本中提取
     text_urls = re.findall(r'https?://[^\s"\'<>]+', html_content)
     for u in text_urls:
         if any(ext in u for ext in ['.json', '.txt', 'raw.githubusercontent', 'gitlab', 'agit', 'bitbucket']):
@@ -289,6 +315,7 @@ def extract_urls_from_html(html_content):
     return list(urls)
 
 def fetch_community_new_sources(state):
+    """从社区源列表采集新的多仓地址（频率由环境变量控制）"""
     if not os.environ.get("ENABLE_COMMUNITY_FETCH", "true").lower() == "true":
         return []
     last_fetch = state.get("last_community_fetch")
@@ -332,6 +359,7 @@ def fetch_community_new_sources(state):
 # ===================== GitHub 搜索 =====================
 
 def github_search_new_sources(token, state):
+    """使用 GitHub API 搜索新的多仓源（每7天一次）"""
     if not token:
         return []
     last_search = state.get("last_search_date")
@@ -377,20 +405,27 @@ def github_search_new_sources(token, state):
 # ===================== 解析源提取单线路 =====================
 
 def extract_single_line_urls(source_url, state):
+    """
+    从多仓或单仓源中提取所有单线路 URL
+    支持多仓（storeHouse）和单仓（urls）格式
+    """
     urls = set()
     req_url = normalize_for_request(source_url)
     data = fetch_json_with_cache(req_url, state)
     if not data:
         return urls
+    # 多仓格式：storeHouse
     if isinstance(data, dict) and 'storeHouse' in data and isinstance(data['storeHouse'], list):
         for item in data['storeHouse']:
             if isinstance(item, dict) and 'sourceUrl' in item:
                 sub_urls = extract_single_line_urls(item['sourceUrl'], state)
                 urls.update(sub_urls)
+    # 单仓格式：urls
     elif isinstance(data, dict) and 'urls' in data and isinstance(data['urls'], list):
         for item in data['urls']:
             if isinstance(item, dict) and 'url' in item:
                 urls.add(item['url'])
+    # 兼容纯数组格式
     elif isinstance(data, list):
         for item in data:
             if isinstance(item, dict) and 'url' in item:
@@ -400,20 +435,26 @@ def extract_single_line_urls(source_url, state):
 # ===================== 验证函数 =====================
 
 def verify_live(url):
+    """存活验证：HEAD 请求，返回 (是否存活, 响应时间毫秒)"""
     start = time.time()
     try:
         req_url = normalize_for_request(url)
         resp = get_session().head(req_url, timeout=int(os.environ.get("REQUEST_TIMEOUT", 10)), allow_redirects=True)
         if resp.status_code == 405:
+            # HEAD 不支持，改用 GET stream 仅读头
             resp = get_session().get(req_url, timeout=10, stream=True)
             resp.close()
         elapsed = (time.time() - start) * 1000
         return 200 <= resp.status_code < 400, elapsed
-    except:
+    except Exception:
         elapsed = (time.time() - start) * 1000
         return False, elapsed
 
 def verify_functional(url, state, max_size):
+    """
+    功能验证：下载完整 JSON，检查是否包含非空 sites 数组且第一个站点有 key 和 name
+    返回 (是否通过, jar_url, 内容哈希)
+    """
     try:
         req_url = normalize_for_request(url)
         resp = get_session().get(req_url, timeout=int(os.environ.get("REQUEST_TIMEOUT", 15)), stream=True)
@@ -432,7 +473,6 @@ def verify_functional(url, state, max_size):
         if 'sites' not in data or not isinstance(data['sites'], list) or len(data['sites']) == 0:
             return False, None, None
         first_site = data['sites'][0]
-        # 检查第一个站点是否有 key 和 name（基本要求）
         if not isinstance(first_site, dict) or 'key' not in first_site or 'name' not in first_site:
             return False, None, None
         jar_url = data.get('spider')
@@ -445,18 +485,20 @@ def verify_functional(url, state, max_size):
 # ===================== jar 备份与替换 =====================
 
 def get_local_base_url():
+    """自动获取本地仓库的 CDN 基础地址（用于对外输出）"""
     try:
         repo_url = subprocess.check_output(['git', 'config', '--get', 'remote.origin.url']).decode().strip()
         match = re.search(r'github\.com[:/](.+?)(\.git)?$', repo_url)
         if match:
             repo_path = match.group(1)
             return f"https://cdn.jsdelivr.net/gh/{repo_path}@main"
-    except:
+    except Exception:
         pass
     log("警告：无法自动获取 LOCAL_BASE_URL，jar替换功能将禁用", "error")
     return None
 
 def backup_jar(jar_url, state):
+    """下载 jar 文件到本地 jars/ 目录，返回哈希（用于引用）"""
     if not jar_url:
         return None
     raw_jar = normalize_for_request(jar_url)
@@ -464,6 +506,7 @@ def backup_jar(jar_url, state):
     jar_dir = Path("jars")
     jar_dir.mkdir(exist_ok=True)
     jar_path = jar_dir / f"{jar_hash}.jar"
+    # 检查是否需要更新（文件不存在或超过30天）
     need_update = not jar_path.exists()
     if not need_update and "jar_update_record" in state:
         last_update = state["jar_update_record"].get(jar_hash, 0)
@@ -487,6 +530,7 @@ def backup_jar(jar_url, state):
         return None
 
 def create_local_line(line_url, original_json_url, jar_backup_hash, state):
+    """生成替换 jar 引用后的本地线路 JSON 文件，返回本地路径"""
     base_cdn = get_local_base_url()
     if not base_cdn:
         return None
@@ -496,7 +540,7 @@ def create_local_line(line_url, original_json_url, jar_backup_hash, state):
         if resp.status_code != 200:
             return None
         data = resp.json()
-    except:
+    except Exception:
         return None
     new_jar_url = f"{base_cdn}/jars/{jar_backup_hash}.jar"
     data['spider'] = new_jar_url
@@ -510,6 +554,7 @@ def create_local_line(line_url, original_json_url, jar_backup_hash, state):
     return str(local_path)
 
 def revert_local_line(line_url, state):
+    """删除已替换的本地线路文件（恢复原始）"""
     line_state = state.get("valid_lines", {}).get(line_url, {})
     local_path = line_state.get("local_line_path")
     if local_path and Path(local_path).exists():
@@ -519,6 +564,7 @@ def revert_local_line(line_url, state):
 # ===================== 源质量统计与淘汰 =====================
 
 def update_source_quality(state, source_url, parse_success):
+    """更新多仓源的质量统计（成功解析次数 / 总尝试次数）"""
     if "source_quality" not in state:
         state["source_quality"] = {}
     qual = state["source_quality"].get(source_url, {"total": 0, "success": 0, "last_parse": 0})
@@ -529,6 +575,7 @@ def update_source_quality(state, source_url, parse_success):
     state["source_quality"][source_url] = qual
 
 def evict_low_quality_sources(state, known_sources, max_sources):
+    """淘汰低质量的多仓源（每月1日执行，内置源除外）"""
     if not os.environ.get("ENABLE_SOURCE_EVICTION", "true").lower() == "true":
         return known_sources
     if datetime.now().day != 1:
@@ -558,6 +605,7 @@ def evict_low_quality_sources(state, known_sources, max_sources):
 # ===================== 内容去重 =====================
 
 def is_duplicate_content(content_hash, state, current_url):
+    """基于内容哈希去重，相同内容的多个 URL 只保留一个"""
     if "content_hash_map" not in state:
         state["content_hash_map"] = {}
     if content_hash in state["content_hash_map"]:
@@ -572,6 +620,7 @@ def is_duplicate_content(content_hash, state, current_url):
 # ===================== 告警 =====================
 
 def send_alert(message, level="info"):
+    """发送告警到 webhook（如果配置了 ALERT_WEBHOOK_URL）"""
     webhook = os.environ.get("ALERT_WEBHOOK_URL")
     if not webhook:
         return
@@ -584,6 +633,7 @@ def send_alert(message, level="info"):
 # ===================== 更新 README =====================
 
 def update_readme(stats):
+    """更新 README.md 中的统计表格（使用注释标记）"""
     readme_path = Path("README.md")
     if not readme_path.exists():
         with open(readme_path, 'w', encoding='utf-8') as f:
@@ -615,15 +665,8 @@ def update_readme(stats):
 # ===================== 主函数 =====================
 
 def main():
-    # 自动创建缺失文件和目录
-    Path("known_sources.txt").touch()
-    Path("community_sources.txt").touch()
-    for d in ["jars", "lines", "archives"]:
-        path = Path(d)
-        path.mkdir(exist_ok=True)
-        keep_file = path / ".gitkeep"
-        if not keep_file.exists():
-            keep_file.touch()
+    # 确保运行必要的文件和目录存在
+    ensure_required_files()
 
     # 读取环境变量
     gh_token = os.environ.get('GH_TOKEN', '')
@@ -688,7 +731,7 @@ def main():
     # 步骤5：源质量淘汰（每月1日）
     known_sources = evict_low_quality_sources(state, known_sources, max_sources)
 
-    # 源轮询限流
+    # 源轮询限流（优先解析最久未解析的源）
     now_ts = time.time()
     source_last_parse = state.get("source_last_parse", {})
     sources_with_priority = [(source_last_parse.get(src, 0), src) for src in known_sources]
@@ -696,7 +739,7 @@ def main():
     selected_sources = [src for _, src in sources_with_priority[:max_sources_per_day]]
     log(f"今日选择解析 {len(selected_sources)} 个源（共 {len(known_sources)} 个）")
 
-    # 步骤6：解析提取单线路
+    # 步骤6：解析选中的源，提取单线路URL
     all_line_urls = set()
     for src in selected_sources:
         log(f"解析源: {src}")
@@ -737,6 +780,7 @@ def main():
     jar_backup_count = 0
     replaced_count = 0
 
+    # 现有有效线路中不需要验证的保留
     new_valid = {url: info.copy() for url, info in state["valid_lines"].items() if url not in to_verify}
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
@@ -745,7 +789,7 @@ def main():
             url = future_to_url[future]
             try:
                 alive, elapsed = future.result()
-            except:
+            except Exception:
                 alive, elapsed = False, 0
             if not alive:
                 verified_fail += 1
@@ -753,7 +797,7 @@ def main():
                     del new_valid[url]
                 state["cooling_lines"][url] = now_ts + cooling_days * 86400
                 continue
-            # 存活成功
+            # 存活成功，检查是否需要功能验证
             need_func = False
             if url not in new_valid:
                 need_func = True
@@ -771,6 +815,7 @@ def main():
                     verified_fail += 1
                     continue
                 verified_success += 1
+                # 备份 jar（每日上限控制）
                 if jar_url and jar_backup_count < max_jar_backups:
                     jar_hash = backup_jar(jar_url, state)
                     if jar_hash:
@@ -785,6 +830,7 @@ def main():
                     "content_hash": content_hash,
                     "response_time_avg": elapsed
                 }
+                # 定期检查原始 jar 存活状态
                 if jar_url and "jar_last_check" not in new_valid[url]:
                     new_valid[url]["jar_last_check"] = 0
                 if jar_url and now_ts - new_valid[url].get("jar_last_check", 0) > jar_live_check_days * 86400:
@@ -793,12 +839,13 @@ def main():
                     new_valid[url]["jar_last_check"] = now_ts
                 else:
                     jar_alive = new_valid[url].get("jar_alive", True)
-                # 替换决策
+                # 替换决策：原始jar失效且已备份
                 if jar_hash and not jar_alive and "local_line_path" not in new_valid[url]:
                     local_path = create_local_line(url, url, jar_hash, state)
                     if local_path:
                         new_valid[url]["local_line_path"] = local_path
                         replaced_count += 1
+                # 恢复：原始jar恢复且已替换
                 if jar_hash and jar_alive and "local_line_path" in new_valid[url]:
                     revert_local_line(url, state)
                     del new_valid[url]["local_line_path"]
@@ -813,14 +860,14 @@ def main():
 
     log(f"验证完成: 成功 {verified_success}, 失败 {verified_fail}")
 
-    # 清理冷却字典
+    # 清理冷却字典中已过期的条目
     for url in list(state["cooling_lines"].keys()):
         if now_ts >= state["cooling_lines"][url]:
             del state["cooling_lines"][url]
 
     state["valid_lines"] = new_valid
 
-    # 清理过期缓存头
+    # 清理过期缓存头（超过30天未访问）
     if "cache_headers" in state:
         cutoff = now_ts - 30 * 86400
         for key in list(state["cache_headers"].keys()):
@@ -830,6 +877,7 @@ def main():
     # ========== 最终输出：标准多线路格式 ==========
     line_scores = []
     for url, info in state["valid_lines"].items():
+        # 评分：最后功能验证时间 + 有备份jar加分
         score = info.get("last_func", 0) * (1 + 0.5 * (1 if info.get("jar_backup_hash") else 0))
         line_scores.append((score, url, info))
     line_scores.sort(key=lambda x: x[0], reverse=True)
@@ -858,15 +906,15 @@ def main():
             file_date = datetime.strptime(date_str, '%Y-%m-%d')
             if (datetime.now() - file_date).days > archive_days:
                 f.unlink()
-        except:
+        except Exception:
             pass
 
-    # 告警
+    # 告警（如果验证失败率过高）
     total_verify = verified_success + verified_fail
     if total_verify > 50 and verified_fail / total_verify > alert_failure_ratio:
         send_alert(f"今日验证失败率过高: {verified_fail}/{total_verify} ({verified_fail/total_verify:.1%})", "warning")
 
-    # 更新README
+    # 更新 README 统计表
     stats = {
         "date": datetime.now().strftime("%Y-%m-%d"),
         "total_sources": len(known_sources),
@@ -880,7 +928,7 @@ def main():
     }
     update_readme(stats)
 
-    # 保存状态
+    # 保存状态文件
     with open(state_file, "w", encoding='utf-8') as f:
         json.dump(state, f, indent=2)
 
